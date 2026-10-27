@@ -1,0 +1,107 @@
+name: training-hub
+
+services:
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2.11.7-alpine}
+    profiles: [public]
+    restart: unless-stopped
+    environment:
+      PUBLIC_IP: ${PUBLIC_IP:-}
+      WEB_PASSWORD_HASH: ${WEB_PASSWORD_HASH:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8443:8443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy:/data
+      - ./data/caddy-config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  inbox:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      LOGSEQ_TOKEN_FILE: /run/secrets/logseq-token
+      LOGSEQ_ENCRYPTION_FILE: /run/secrets/logseq-encryption.json
+      GEMINI_KEY_FILE: /run/secrets/gemini-api-key
+    ports:
+      - "127.0.0.1:8001:8080"
+    volumes:
+      - ./data/inbox:/data
+      - ./.secrets/logseq-token:/run/secrets/logseq-token:ro
+      - ./.secrets/logseq-encryption.json:/run/secrets/logseq-encryption.json:ro
+      - ./.secrets/gemini-api-key:/run/secrets/gemini-api-key:ro
+    init: true
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  n8n:
+    image: ${N8N_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: http
+      N8N_SECURE_COOKIE: "false"
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      # The private editor's workflow reads only the bridge credential.
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      BRIDGE_TOKEN: ${BRIDGE_TOKEN}
+      GENERIC_TIMEZONE: Europe/Berlin
+      TZ: Europe/Berlin
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "168"
+    volumes:
+      - ./data/n8n:/home/node/.n8n
+      - ./workflows:/workflows:ro
+    logging: *logging
+
+  logseq-web:
+    image: ${LOGSEQ_WEB_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:8080"
+    volumes:
+      - ./deploy/logseq-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/training-config.js:/usr/share/nginx/html/training-config.js:ro
+    logging: *logging
+
+  logseq-sync:
+    image: ${LOGSEQ_SYNC_IMAGE}
+    restart: unless-stopped
+    environment:
+      COGNITO_ISSUER: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_dtagLnju8
+      COGNITO_CLIENT_ID: 69cs1lgme7p8kbgld8n5kseii6
+      COGNITO_JWKS_URL: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_dtagLnju8/.well-known/jwks.json
+      WRANGLER_LOG: warn
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./data/logseq:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/worker/.wrangler/tmp:uid=1000,gid=1000,mode=1777
+      - /app/worker/node_modules/.mf:uid=1000,gid=1000,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging: *logging

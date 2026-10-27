@@ -1,0 +1,81 @@
+{
+  "id": "trainingTelegramInbox",
+  "name": "Training inbox - Telegram and optional Gemini",
+  "active": false,
+  "nodes": [
+    {
+      "id": "manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 200],
+      "parameters": {}
+    },
+    {
+      "id": "schedule",
+      "name": "Every 30 seconds",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "parameters": {"rule": {"interval": [{"field": "seconds", "secondsInterval": 30}]}}
+    },
+    {
+      "id": "pending",
+      "name": "Fetch Telegram and pending inbox",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 0],
+      "parameters": {
+        "url": "http://inbox:8080/pending",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Authorization", "value": "={{ 'Bearer ' + $env.BRIDGE_TOKEN }}"}]},
+        "options": {"timeout": 60000}
+      }
+    },
+    {
+      "id": "split",
+      "name": "One submission at a time",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [480, 0],
+      "parameters": {"fieldToSplitOut": "submissions", "options": {"destinationFieldName": "submission"}}
+    },
+    {
+      "id": "ai-stub",
+      "name": "AI policy configured in inbox",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [720, 0],
+      "parameters": {},
+      "notesInFlow": true,
+      "notes": "AI is off by default. AI_ENABLED and the mounted Gemini key control caption-first analysis in the inbox. Duration gates, approval, caching, daily limits, and quota waits are persisted there; original notes are saved first."
+    },
+    {
+      "id": "save",
+      "name": "Save attachment, publish to Logseq, acknowledge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 0],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "http://inbox:8080/capture",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Authorization", "value": "={{ 'Bearer ' + $env.BRIDGE_TOKEN }}"}]},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ id: $json.submission.id }) }}",
+        "options": {"timeout": 180000}
+      }
+    }
+  ],
+  "connections": {
+    "Run manually": {"main": [[{"node": "Fetch Telegram and pending inbox", "type": "main", "index": 0}]]},
+    "Every 30 seconds": {"main": [[{"node": "Fetch Telegram and pending inbox", "type": "main", "index": 0}]]},
+    "Fetch Telegram and pending inbox": {"main": [[{"node": "One submission at a time", "type": "main", "index": 0}]]},
+    "One submission at a time": {"main": [[{"node": "AI policy configured in inbox", "type": "main", "index": 0}]]},
+    "AI policy configured in inbox": {"main": [[{"node": "Save attachment, publish to Logseq, acknowledge", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1", "saveDataSuccessExecution": "none", "saveDataErrorExecution": "all"},
+  "pinData": {}
+}

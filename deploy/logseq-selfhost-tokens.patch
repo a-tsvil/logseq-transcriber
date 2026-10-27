@@ -1,0 +1,13 @@
+diff --git a/deps/db-sync/src/logseq/db_sync/worker/handler/personal_access_token.cljs b/deps/db-sync/src/logseq/db_sync/worker/handler/personal_access_token.cljs
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/personal_access_token.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/personal_access_token.cljs
+@@ -133,6 +133,8 @@
+     (if-not (string? user-id)
+       (http/unauthorized)
+-      (p/let [rtc-user? (<rtc-user? request claims)]
++      ;; Self-hosted tokens still require verified identity and graph membership.
++      (p/let [rtc-user? (or (= "true" (aget env "LOGSEQ_SELF_HOSTED"))
++                           (<rtc-user? request claims))]
+         (cond
+           (not rtc-user?)
+           (http/forbidden)

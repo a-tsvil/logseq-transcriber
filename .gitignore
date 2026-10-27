@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.secrets/
+.aws/
+.agents/
+.codex/
+data/
+backups/
+__pycache__/
+*.pyc
+*.pem
+*.key
+*.p12
+*.pfx

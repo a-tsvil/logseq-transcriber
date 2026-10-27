@@ -1,0 +1,48 @@
+--- a/deps/db-sync/src/logseq/db_sync/common.cljs
++++ b/deps/db-sync/src/logseq/db_sync/common.cljs
+@@ -4,6 +4,14 @@
+             [logseq.db-sync.platform.core :as platform]
+             [logseq.db.sqlite.util :as sqlite-util]
+             [promesa.core :as p]))
++
++(defn public-origin
++  "Preserve TLS terminated by the trusted local reverse proxy."
++  [request]
++  (let [url (js/URL. (.-url request))]
++    (when (= "https" (.get (.-headers request) "x-forwarded-proto"))
++      (set! (.-protocol url) "https:"))
++    (.-origin url)))
+ 
+ (defn cors-headers []
+   #js {"Access-Control-Allow-Origin" "*"
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/sync.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/sync.cljs
+@@ -150,8 +150,7 @@
+ ;;     (str (.-origin url) "/assets/" graph-id "/" snapshot-id ".snapshot")))
+ 
+ (defn- snapshot-stream-url [request graph-id]
+-  (let [url (js/URL. (.-url request))]
+-    (str (.-origin url) "/sync/" graph-id "/snapshot/stream")))
++  (str (common/public-origin request) "/sync/" graph-id "/snapshot/stream"))
+ 
+ (defn- maybe-decompress-stream [stream encoding]
+   (if (and (= encoding snapshot-content-encoding) (exists? js/DecompressionStream))
+--- a/deps/db-sync/src/logseq/db_sync/worker/asset_link.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/asset_link.cljs
+@@ -1,5 +1,6 @@
+ (ns logseq.db-sync.worker.asset-link
+-  (:require [logseq.db-sync.worker.handler.assets :as assets-handler]
++  (:require [logseq.db-sync.common :as common]
++            [logseq.db-sync.worker.handler.assets :as assets-handler]
+             [promesa.core :as p]))
+ 
+ (def ^:private ttl-seconds 300)
+@@ -36,7 +37,7 @@
+         data (.encode (js/TextEncoder.) (payload graph-id file expires))]
+     (p/let [key (secret-key env ["sign"])
+             signature (.sign (.-subtle js/crypto) "HMAC" key data)
+-            url (js/URL. (str "/assets/" graph-id "/" file) (.-url request))]
++            url (js/URL. (str "/assets/" graph-id "/" file) (common/public-origin request))]
+       (.set (.-searchParams url) "expires" (str expires))
+       (.set (.-searchParams url) "signature" (signature-hex signature))
+       {:url (str url) :expires-at expires})))
