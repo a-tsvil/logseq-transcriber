@@ -1,0 +1,110 @@
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -357,6 +357,7 @@
+                     parsed (when (and id (valid-id? id)) (uuid (string/lower-case id)))
+                     existing (when parsed (d/entity db [:block/uuid parsed]))]
+                 (and (non-blank-string? (:title node))
++                     (or (not (contains? node :task)) (boolean? (:task node)))
+                      (or (not (contains? node :uuid))
+                          (and parsed (not (contains? @seen parsed))
+                               (do (swap! seen conj parsed) true)))
+@@ -378,12 +379,20 @@
+ (defn- insert-tree! [conn target nodes position e2ee?]
+   (let [nodes (vec nodes)
+         blocks (mapv #(tree-block conn e2ee? %) nodes)
+-        fresh (filterv #(nil? (d/entity @conn [:block/uuid (:block/uuid %)])) blocks)]
++        fresh (filterv #(nil? (d/entity @conn [:block/uuid (:block/uuid %)])) blocks)
++        fresh-ids (set (map :block/uuid fresh))]
+     (when (seq fresh)
+       (outliner-core/insert-blocks! conn fresh target
+                                    {:sibling? false :top? (= position "prepend")
+                                      :bottom? (not= position "prepend") :keep-uuid? true}))
+     (mapv (fn [node block]
++            ;; Initialize only newly inserted tasks; retries must preserve DONE/status edits.
++            (when (and (true? (:task node)) (contains? fresh-ids (:block/uuid block)))
++              (let [task (d/entity @conn [:block/uuid (:block/uuid block)])]
++                (outliner-property/set-block-property! conn (:db/id task) :block/tags
++                                                       (:db/id (d/entity @conn :logseq.class/Task)))
++                (outliner-property/set-block-property! conn (:db/id task) :logseq.property/status
++                                                       (:db/id (d/entity @conn :logseq.property/status.todo)))))
+             (let [existing (d/entity @conn [:block/uuid (:block/uuid block)])
+                   children (when (seq (:children node))
+                              (insert-tree! conn existing (:children node) "append" e2ee?))]
+@@ -395,12 +404,22 @@
+   (let [now (js/Date.)]
+     (+ (* (.getFullYear now) 10000) (* (inc (.getMonth now)) 100) (.getDate now))))
+ 
+-(defn- ensure-today-page! [conn]
+-  (let [day (today-journal-day)]
++(defn valid-journal-day? [day]
++  (and (integer? day) (<= 10000101 day 99991231)
++       (let [year (quot day 10000)
++             month (quot (mod day 10000) 100)
++             date (mod day 100)
++             parsed (js/Date. (js/Date.UTC year (dec month) date))]
++         (and (= year (.getUTCFullYear parsed))
++              (= month (inc (.getUTCMonth parsed)))
++              (= date (.getUTCDate parsed))))))
++
++(defn- ensure-journal-page! [conn day]
++  (let [day (or day (today-journal-day))]
+     (or (ldb/get-journal-page-by-day @conn day)
+         (let [formatter (:logseq.property.journal/title-format (d/entity @conn :logseq.class/Journal))
+               title (date-time-util/int->journal-title day formatter)
+-              [_ page-id] (outliner-page/create! conn title {:journal? true :today-journal? true})]
++              [_ page-id] (outliner-page/create! conn title {:journal? true :today-journal? (= day (today-journal-day))})]
+           (d/entity @conn [:block/uuid page-id])))))
+ 
+ (defn- resolve-property-ident [db value]
+@@ -802,9 +821,10 @@
+ 
+     :semantic/capture
+     (p/let [body (body-clj request)]
+-      (if (or (not (sequential? (:blocks body))) (empty? (:blocks body)))
+-        (http/bad-request "missing blocks")
+-        (let [today (authored-write! conn creator ensure-today-page!)]
++      (if (or (not (sequential? (:blocks body))) (empty? (:blocks body))
++              (and (contains? body :journal-day) (not (valid-journal-day? (:journal-day body)))))
++        (http/bad-request "invalid blocks or journal-day")
++        (let [today (authored-write! conn creator ensure-journal-page! (:journal-day body))]
+           (if-not (valid-tree-identities? @conn today (:blocks body))
+             (http/bad-request "invalid capture block identities")
+             (let [inserted (authored-write! conn creator insert-tree! today (:blocks body) "append" e2ee?)]
+@@ -904,7 +924,7 @@
+              (fn [temp-conn]
+                (let [target (if target
+                               (d/entity @temp-conn [:block/uuid (:block/uuid target)])
+-                              (ensure-today-page! temp-conn))
++                              (ensure-journal-page! temp-conn nil))
+                      inserted (first (insert-tree! temp-conn target [{:title (:title body)}] "append" e2ee?))
+                      task-uuid (uuid (:uuid inserted))
+                      task (d/entity @temp-conn [:block/uuid task-uuid])]
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -102,7 +102,7 @@
+    "deleteBlockProperty" ["Delete a block property" "Idempotently removes one property from one block. The property definition itself is not deleted."]
+    "batchSetBlockProperty" ["Set block properties in a batch" "Atomically adds or replaces multiple typed block-property values in a DB graph after validating every entry. Property IDs are UUIDs or idents; never use legacy file-graph key:: value syntax."]
+    "batchDeleteBlockProperty" ["Delete block properties in a batch" "Atomically removes multiple block-property values after validating every entry."]
+-   "captureToToday" ["Capture to today's journal" "Creates today's journal page when necessary and appends the supplied recursive block trees to its end."]
++   "captureToToday" ["Capture to today's journal" "Creates a journal page when necessary and appends recursive block trees. Optional journal-day pins the date for retry-safe capture; omitted dates use the server day."]
+    "listTasks" ["List DB tasks" "Lists cursor-paginated DB Task objects using the Task class index, with optional status, priority, and title-content filters. Use this operation instead of graph search to retrieve tasks."]
+    "createTask" ["Create a DB task" "Creates a DB Task object with the Task class and typed status, priority, scheduled, and deadline properties. Never encode a task as Markdown TODO text."]
+    "listTags" ["List tags" "Returns a cursor-paginated list of tag entities in the graph."]
+@@ -224,7 +224,8 @@
+                                                                :properties {:block-id {:type "string"}
+                                                                             :property-id {:type "string"}}}}}}
+     "captureToToday" {:required ["blocks"]
+-                      :properties {:blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
++                      :properties {:journal-day {:type "integer" :description "Optional valid calendar date as YYYYMMDD; preserves the intended date across retries."}
++                                   :blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
+     "createTask" {:required ["title"]
+                   :properties {:title {:type "string"}
+                                :page-id {:type "string"
+@@ -349,6 +350,7 @@
+                           :properties {:uuid {:type "string" :format "uuid"
+                                               :description "Optional stable identity for retry-safe insertion. An existing block under the same parent is reused without changing its title or order; duplicate IDs and other-parent collisions are rejected."}
+                                        :title {:type "string"}
++                                       :task {:type "boolean" :description "Initialize a new block as a native TODO Task. Existing blocks retain their current status on retries."}
+                                        :children {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
+               :BlockResponse {:type "object" :required ["uuid" "kind" "title"]
+                               :properties {:uuid {:type "string"}

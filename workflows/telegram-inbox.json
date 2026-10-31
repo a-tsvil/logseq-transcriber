@@ -13,11 +13,11 @@
     },
     {
       "id": "schedule",
-      "name": "Every 30 seconds",
+      "name": "Every 5 seconds",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [0, 0],
-      "parameters": {"rule": {"interval": [{"field": "seconds", "secondsInterval": 30}]}}
+      "parameters": {"rule": {"interval": [{"field": "seconds", "secondsInterval": 5}]}}
     },
     {
       "id": "pending",
@@ -71,7 +71,7 @@
   ],
   "connections": {
     "Run manually": {"main": [[{"node": "Fetch Telegram and pending inbox", "type": "main", "index": 0}]]},
-    "Every 30 seconds": {"main": [[{"node": "Fetch Telegram and pending inbox", "type": "main", "index": 0}]]},
+    "Every 5 seconds": {"main": [[{"node": "Fetch Telegram and pending inbox", "type": "main", "index": 0}]]},
     "Fetch Telegram and pending inbox": {"main": [[{"node": "One submission at a time", "type": "main", "index": 0}]]},
     "One submission at a time": {"main": [[{"node": "AI policy configured in inbox", "type": "main", "index": 0}]]},
     "AI policy configured in inbox": {"main": [[{"node": "Save attachment, publish to Logseq, acknowledge", "type": "main", "index": 0}]]}

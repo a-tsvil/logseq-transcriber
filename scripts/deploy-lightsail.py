@@ -15,7 +15,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--profile", default="ctd")
 parser.add_argument("--region", default="us-east-1")
 parser.add_argument("--name", default="training-hub-dev")
-parser.add_argument("--public-ip", action="store_true", help="Attach a static IP and enable IP-restricted public HTTPS")
+parser.add_argument("--public-ip", action="store_true", help="Attach a static IP and enable public HTTPS (account-restricted with the hardened worker)")
 args = parser.parse_args()
 
 
@@ -106,12 +106,22 @@ if args.public_ip or state.get("static_ip_name"):
 state["ip"] = ip
 state_file.write_text(json.dumps(state, indent=2))
 state_file.chmod(0o600)
+sync_image = next(line.split("=", 1)[1] for line in (ROOT / ".env").read_text().splitlines()
+                  if line.startswith("LOGSEQ_SYNC_IMAGE="))
+account_restricted = sync_image in ("training-hub-logseq-sync:69da7e-selfhost3", "training-hub-logseq-sync:69da7e-selfhost4", "training-hub-logseq-sync:69da7e-selfhost5", "training-hub-logseq-sync:69da7e-selfhost6")
+if account_restricted:
+    policy = dict(line.split("=", 1) for line in (ROOT / ".secrets/sync-policy.env").read_text().splitlines() if "=" in line)
+    if not policy.get("TRAINING_OWNER_EMAIL") or len(policy.get("TRAINING_ALLOWLIST_TOKEN", "")) < 64:
+        raise SystemExit("Configure .secrets/sync-policy.env before exposing the account-restricted worker.")
 ports = [{"fromPort": 22, "toPort": 22, "protocol": "tcp", "cidrs": [operator_ip + "/32"]}]
 if state.get("static_ip_name"):
     ports.append({"fromPort": 80, "toPort": 80, "protocol": "tcp", "cidrs": ["0.0.0.0/0"]})
-    ports.extend({"fromPort": port, "toPort": port, "protocol": "tcp", "cidrs": [operator_ip + "/32"]}
+    ports.extend({"fromPort": port, "toPort": port, "protocol": "tcp", "cidrs": ["0.0.0.0/0"] if account_restricted else [operator_ip + "/32"]}
                  for port in (443, 8443))
-aws("put-instance-public-ports", "--instance-name", args.name, "--port-infos", json.dumps(ports))
+# Keep application ports IP-restricted until the deployed worker passes its checks.
+initial_ports = [{**port, "cidrs": [operator_ip + "/32"]} if port["fromPort"] in (443, 8443) else port
+                 for port in ports]
+aws("put-instance-public-ports", "--instance-name", args.name, "--port-infos", json.dumps(initial_ports))
 if not key.exists():
     raise SystemExit("The local deployment SSH key is missing.")
 ssh = ["ssh", "-F", "/dev/null", "-i", str(key), "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new",
@@ -131,7 +141,7 @@ run([*ssh, "sudo cloud-init status --wait >/dev/null 2>&1 || true; if [ ! -f /va
 with tempfile.TemporaryDirectory() as temporary:
     sync_image = next(line.split("=", 1)[1] for line in (ROOT / ".env").read_text().splitlines()
                       if line.startswith("LOGSEQ_SYNC_IMAGE="))
-    if sync_image in ("training-hub-logseq-sync:69da7e-selfhost1", "training-hub-logseq-sync:69da7e-selfhost2"):
+    if sync_image in ("training-hub-logseq-sync:69da7e-selfhost1", "training-hub-logseq-sync:69da7e-selfhost2", "training-hub-logseq-sync:69da7e-selfhost3", "training-hub-logseq-sync:69da7e-selfhost4", "training-hub-logseq-sync:69da7e-selfhost5", "training-hub-logseq-sync:69da7e-selfhost6"):
         image_id = run(["docker", "image", "inspect", sync_image, "--format", "{{.Id}}"], capture_output=True).stdout.strip()
         remote_id = subprocess.run([*ssh, "docker image inspect " + sync_image + " --format '{{.Id}}'"],
                                    capture_output=True, text=True)
@@ -142,11 +152,17 @@ with tempfile.TemporaryDirectory() as temporary:
                 subprocess.run([*ssh, "docker load"], stdin=stream, check=True)
     archive = Path(temporary) / "training-hub.tar.gz"
     with tarfile.open(archive, "w:gz") as output:
-        for entry in ("compose.yaml", "Dockerfile", "requirements.txt", ".dockerignore", "README.md", "src", "workflows", "deploy", "scripts/setup.py", "scripts/configure-web.py", "scripts/pin-images.py", "scripts/smoke.py", ".env", ".secrets/logseq-token", ".secrets/logseq-encryption.json", ".secrets/gemini-api-key"):
+        for entry in ("compose.yaml", "Dockerfile", "requirements.txt", "requirements-import.txt", ".dockerignore", "README.md", "src", "workflows", "deploy", "scripts/setup.py", "scripts/pin-images.py", "scripts/smoke.py", ".env", ".secrets/logseq-token", ".secrets/logseq-encryption.json", ".secrets/gemini-api-key", ".secrets/sync-policy.env", ".secrets/logseq-graphs.json"):
+            # An empty local placeholder must not erase a key configured on the server.
+            if entry == ".secrets/gemini-api-key" and not (ROOT / entry).read_bytes().strip():
+                continue
             output.add(ROOT / entry, arcname=entry)
     with archive.open("rb") as stream:
-        subprocess.run([*ssh, "umask 022; tar xzf - -C /opt/training-hub && chmod 700 /opt/training-hub/.secrets && chmod 600 /opt/training-hub/.env /opt/training-hub/.secrets/logseq-token /opt/training-hub/.secrets/logseq-encryption.json /opt/training-hub/.secrets/gemini-api-key"], stdin=stream, check=True)
-run([*ssh, "cd /opt/training-hub && python3 scripts/setup.py && docker compose pull --policy missing && python3 scripts/configure-web.py && python3 scripts/pin-images.py && docker compose up -d --build"])
+        subprocess.run([*ssh, "umask 022; tar xzf - -C /opt/training-hub && touch /opt/training-hub/.secrets/gemini-api-key && chmod 700 /opt/training-hub/.secrets && chmod 600 /opt/training-hub/.env /opt/training-hub/.secrets/logseq-token /opt/training-hub/.secrets/logseq-encryption.json /opt/training-hub/.secrets/gemini-api-key /opt/training-hub/.secrets/sync-policy.env /opt/training-hub/.secrets/logseq-graphs.json"], stdin=stream, check=True)
+run([*ssh, "cd /opt/training-hub && python3 scripts/setup.py && docker compose pull --policy missing && python3 scripts/pin-images.py && docker compose up -d --build --remove-orphans"])
+run([*ssh, "cd /opt/training-hub && docker compose up -d --force-recreate --no-deps inbox"])
+if state.get("static_ip_name"):
+    run([*ssh, "cd /opt/training-hub && docker compose up -d --force-recreate --no-deps caddy"])
 for _ in range(45):
     check = subprocess.run([*ssh, "cd /opt/training-hub && python3 scripts/smoke.py"], capture_output=True, text=True)
     if check.returncode == 0:
@@ -155,6 +171,10 @@ for _ in range(45):
     time.sleep(2)
 else:
     raise SystemExit("Services did not pass remote health checks. Inspect docker compose logs, then rerun to resume.")
+aws("put-instance-public-ports", "--instance-name", args.name, "--port-infos", json.dumps(ports))
+run([*ssh, "cd /opt/training-hub && docker compose exec -T inbox python configure_bot.py"])
+if "IMAGE_SEARCH_ENABLED=true" in (ROOT / ".env").read_text().splitlines():
+    run([*ssh, "cd /opt/training-hub && if [ -s .secrets/telegram-index/telegram-index.session ]; then docker compose --profile image-search up -d --build --no-deps image-delivery; fi"])
 run([*ssh, "cd /opt/training-hub && if [ ! -f data/n8n/.training-workflow-imported ]; then docker compose exec -T n8n n8n import:workflow --input=/workflows/telegram-inbox.json && touch data/n8n/.training-workflow-imported; fi"])
 # Retain the exact deployed versions for subsequent deploys and migration.
 deployed_env = run([*ssh, "cat /opt/training-hub/.env"], capture_output=True).stdout

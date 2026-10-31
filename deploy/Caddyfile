@@ -7,7 +7,7 @@
     tls {
         issuer acme https://acme-v02.api.letsencrypt.org/directory {
             profile shortlived
-            # Only port 80 is globally open; application ports are IP-restricted.
+            # Certificate renewal uses port 80.
             disable_tlsalpn_challenge
         }
     }
@@ -15,18 +15,17 @@
 
 https://{$PUBLIC_IP} {
     import ip_certificate
-    basic_auth {
-        training {$WEB_PASSWORD_HASH}
-    }
     handle /media/* {
         reverse_proxy inbox:8080
     }
     handle {
-        reverse_proxy logseq-web:8080
+        respond 404
     }
 }
 
 https://{$PUBLIC_IP}:8443 {
     import ip_certificate
+    @policy path /training /training/* /admin /admin/*
+    respond @policy 404
     reverse_proxy logseq-sync:8787
 }

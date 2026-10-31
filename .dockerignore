@@ -3,5 +3,6 @@
 .git
 data
 backups
+.backups
 tests
 __pycache__

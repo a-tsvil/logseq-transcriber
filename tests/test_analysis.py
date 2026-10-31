@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from src.analysis import Analyzer, FIELDS, MAX_VIDEO_BYTES, generate, limit_download_size, render_analysis, validate_result, video_part
+from src.analysis import Analyzer, COOKING_PROMPT, COOKING_SCHEMA, FIELDS, MAX_ATTEMPTS, MAX_VIDEO_BYTES, generate, limit_download_size, render_analysis, retry_delay, validate_result, video_part
 
 
 def result(needs_video=False):
@@ -26,8 +26,18 @@ def record(duration=30):
             "descriptions": [{"url": "https://www.youtube.com/watch?v=BaW_jenozKc", "status": "empty", "duration_seconds": duration}]}
 
 
+def recipe(needs_video=False):
+    return {"needs_video": needs_video, "summary": "Omelette", "transcript": None,
+            "ingredients": [{"name": "Eggs", "quantity": "about 2 eggs", "estimated": True,
+                             "notes": "beaten", "evidence": "00:02"}],
+            "steps": ["Beat the eggs (00:02); cook until set (00:10). Heat and duration not specified."]}
+
+
 class AnalysisTests(unittest.TestCase):
     def setUp(self):
+        jitter = patch("src.analysis.random.uniform", return_value=0)
+        jitter.start()
+        self.addCleanup(jitter.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.db = sqlite3.connect(Path(self.temp.name) / "inbox.sqlite")
         self.key = Path(self.temp.name) / "gemini-key"
@@ -70,6 +80,61 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(api.call_count, 2)
         self.assertEqual(final["source"], "video")
         self.assertEqual(api.call_args.args[0], "gemini-3.5-flash-lite")
+
+    def test_complete_cooking_caption_skips_video_and_renders_estimates_and_method(self):
+        item = record()
+        item["analysis"]["type"] = "cooking"
+        item["original_text"] = "/cook " + item["original_text"]
+        item["descriptions"][0].update(status="copied", text="Beat two eggs; fry until set.")
+        with patch("src.analysis.generate", return_value=recipe()) as api, patch("src.analysis.video_part") as video:
+            analysis = self.ai.step(item)
+        self.assertEqual(analysis["status"], "completed")
+        self.assertEqual(analysis["type"], "cooking")
+        self.assertEqual(api.call_args.kwargs["prompt"], COOKING_PROMPT)
+        self.assertEqual(api.call_args.kwargs["schema"], COOKING_SCHEMA)
+        self.assertEqual(api.call_args.kwargs["max_output_tokens"], 8192)
+        self.assertNotIn("/cook", api.call_args.args[1][0]["text"])
+        rendered = render_analysis(analysis)
+        self.assertIn("AI cooking recipe", rendered)
+        self.assertIn("quantity is estimated", rendered)
+        self.assertIn("1. Beat the eggs", rendered)
+        self.assertNotIn("exercise", rendered)
+        video.assert_not_called()
+
+    def test_incomplete_cooking_caption_falls_back_to_video_with_caption_context(self):
+        item = record()
+        item["analysis"]["type"] = "cooking"
+        item["descriptions"][0].update(status="copied", text="My omelette! Two eggs.")
+        with patch("src.analysis.generate", side_effect=[recipe(True), recipe()]) as api:
+            item["analysis"] = self.ai.step(item)
+            self.assertEqual(item["analysis"]["status"], "pending_video")
+            analysis = self.ai.step(item)
+        self.assertEqual(analysis["source"], "video")
+        self.assertIn("My omelette! Two eggs.", api.call_args.args[1][1]["text"])
+
+    def test_cooking_without_caption_goes_directly_to_video_and_keeps_duration_gate(self):
+        item = record()
+        item["original_text"] = "/cook " + item["original_text"]
+        item["analysis"]["type"] = "cooking"
+        with patch("src.analysis.generate", return_value=recipe()) as api:
+            self.assertEqual(self.ai.step(item)["source"], "video")
+            self.assertEqual(api.call_count, 1)
+            item["descriptions"][0]["duration_seconds"] = 121
+            self.assertEqual(self.ai.step(item)["status"], "needs_approval")
+            self.assertEqual(api.call_count, 1)
+
+    def test_cooking_cache_is_separate_from_exercises_and_includes_caption_context(self):
+        with patch("src.analysis.generate", side_effect=[result(), recipe(), recipe()]) as api:
+            self.ai.step(record())
+            item = record()
+            item["analysis"].update(type="cooking", text_checked=True)
+            self.assertFalse(self.ai.step(item)["cached"])
+            restarted = Analyzer(self.db, self.temp.name, True, str(self.key))
+            self.assertTrue(restarted.step(item)["cached"])
+            item["descriptions"][0].update(status="copied", text="Use three eggs instead.")
+            self.assertFalse(restarted.step(item)["cached"])
+        self.assertEqual(api.call_count, 3)
+        self.assertEqual(self.db.execute("SELECT SUM(videos) FROM ai_usage").fetchone()[0], 3)
 
     def test_duration_boundaries_block_video_download_and_api_without_consent(self):
         for duration, expected in ((120.01, "needs_approval"), (600, "needs_approval"), (600.01, "too_long")):
@@ -123,18 +188,59 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(self.ai.step(record())["status"], "completed")
             self.assertEqual(api.call_count, 1)
 
-    def test_quota_429_backs_off_globally_and_stops_after_three_attempts(self):
+    def test_quota_429_backs_off_globally_and_stops_after_five_attempts(self):
         error = HTTPError("https://generativelanguage.googleapis.com/v1beta/interactions", 429, "quota", None, None)
+        now = 1700000000
         with patch("src.analysis.generate", side_effect=error) as api:
-            for index in range(3):
-                with patch("src.analysis.time.time", return_value=1700000000 + index * 901):
+            for index in range(MAX_ATTEMPTS):
+                with patch("src.analysis.time.time", return_value=now):
                     response = self.ai.step(record())
-                    self.assertEqual(response["status"], "quota_wait" if index < 2 else "needs_review")
+                    self.assertEqual(response["status"], "quota_wait" if index < MAX_ATTEMPTS - 1 else "needs_review")
                     other = record()
                     other["descriptions"][0]["url"] = "https://www.youtube.com/watch?v=otherVideo1"
                     self.assertEqual(self.ai.step(other)["status"], "quota_wait")
-            self.assertEqual(api.call_count, 3)
+                    now = self.db.execute("SELECT until FROM ai_cooldown").fetchone()[0] + 1
+            self.assertEqual(api.call_count, MAX_ATTEMPTS)
         error.close()
+
+    def test_exponential_retry_persists_across_restart_and_other_work_shares_cooldown(self):
+        error = HTTPError("https://example.com", 503, "unavailable", None, None)
+        now = 1700000000
+        item = record()
+        with patch("src.analysis.generate", side_effect=error) as api:
+            for index, delay in enumerate((30, 60, 120, 240)):
+                with patch("src.analysis.time.time", return_value=now):
+                    item["analysis"] = self.ai.step(item)
+                    self.assertEqual(item["analysis"]["retry_after"], now + delay)
+                    self.assertEqual(item["analysis"]["attempts"], index + 1)
+                    restarted = Analyzer(self.db, self.temp.name, True, str(self.key))
+                    self.assertEqual(restarted.step(record())["retry_after"], now + delay)
+                    other = record()
+                    other["descriptions"][0]["url"] += "different"
+                    self.assertEqual(restarted.step(other)["status"], "quota_wait")
+                    self.assertEqual(api.call_count, index + 1)
+                now += delay
+        with patch("src.analysis.time.time", return_value=now), patch("src.analysis.generate", return_value=result()) as api:
+            self.assertEqual(self.ai.step(item)["status"], "completed")
+            self.assertEqual(api.call_count, 1)
+        error.close()
+
+    def test_permanent_http_errors_are_not_retried_and_diagnostics_are_private(self):
+        for status in (400, 401, 403, 404):
+            self.db.execute("DELETE FROM ai_cache")
+            self.db.commit()
+            error = HTTPError("https://example.com", status, "bad", None,
+                              io.BytesIO(json.dumps({"error": {"message": "private secret: too many states"}}).encode()))
+            with patch("src.analysis.generate", side_effect=error) as api:
+                failed = self.ai.step(record())
+                self.assertEqual(failed["http_status"], status)
+                self.assertEqual(failed["status"], "needs_review")
+                self.assertNotIn("private secret", json.dumps(failed))
+                if status == 400:
+                    self.assertEqual(failed["error_code"], "schema_too_complex")
+                self.assertEqual(self.ai.step(record())["reason"], failed["reason"])
+                self.assertEqual(api.call_count, 1)
+            error.close()
 
     def test_timeout_or_crash_is_not_automatically_repeated(self):
         with patch("src.analysis.generate", side_effect=TimeoutError) as api:
@@ -171,6 +277,34 @@ class AnalysisTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_retry_delay_honors_header_dates_numeric_values_and_jitter(self):
+        with patch("src.analysis.random.uniform", return_value=7):
+            for header, expected in ((None, 37), ("120", 120), ("bad", 37), ("NaN", 37),
+                                     ("Infinity", 37), ("-1", 37),
+                                     ("Tue, 14 Nov 2023 22:15:20 GMT", 120)):
+                error = HTTPError("https://example.com", 503, "unavailable", {"Retry-After": header} if header else {}, None)
+                self.assertEqual(retry_delay(error, 1, 1700000000), expected)
+                error.close()
+
+    def test_cooking_schema_does_not_expand_array_limits_into_provider_constraints(self):
+        self.assertNotIn("maxItems", COOKING_SCHEMA["properties"]["ingredients"])
+        self.assertNotIn("maxItems", COOKING_SCHEMA["properties"]["steps"])
+        with self.assertRaises(ValueError):
+            validate_result({**recipe(), "steps": ["fry"] * 61}, cooking=True)
+
+    def test_cooking_transport_uses_recipe_schema_budget_and_validator(self):
+        response = {"status": "completed", "steps": [{"type": "model_output", "content": [
+            {"type": "text", "text": json.dumps(recipe())}]}]}
+        with patch("src.analysis.urlopen", return_value=io.BytesIO(json.dumps(response).encode())) as http:
+            parsed = generate("gemini-3.5-flash-lite", [], "FAKE_TEST_KEY", prompt=COOKING_PROMPT,
+                              schema=COOKING_SCHEMA, validate=lambda value: validate_result(value, cooking=True),
+                              max_output_tokens=8192)
+        self.assertEqual(parsed, recipe())
+        payload = json.loads(http.call_args.args[0].data)
+        self.assertEqual(payload["system_instruction"], COOKING_PROMPT)
+        self.assertEqual(payload["response_format"]["schema"], COOKING_SCHEMA)
+        self.assertEqual(payload["generation_config"]["max_output_tokens"], 8192)
+
     def test_interactions_request_bounds_output_keeps_key_out_of_url_and_validates_json(self):
         response = {"status": "completed", "steps": [{"type": "model_output", "content": [{"type": "text", "text": json.dumps(result())}]}]}
         with patch("src.analysis.urlopen", return_value=io.BytesIO(json.dumps(response).encode())) as http:
@@ -194,6 +328,19 @@ class TransportTests(unittest.TestCase):
         for change in ({"needs_video": "false"}, {"summary": None}, {"exercises": ["squats"]}, {"extra": "field"}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_result({**result(), **change})
+
+    def test_cooking_validation_accepts_unknown_quantities_and_rejects_malformed_output(self):
+        valid = recipe()
+        valid["ingredients"][0].update(quantity=None, estimated=False, notes="Amount obscured")
+        self.assertEqual(validate_result(valid, cooking=True), valid)
+        invalids = [result(), {**recipe(), "steps": "fry"}, {**recipe(), "steps": [""]},
+                    {**recipe(), "steps": ["x" * 2001]}, {**recipe(), "ingredients": ["eggs"]},
+                    {**recipe(), "ingredients": [{**recipe()["ingredients"][0], "estimated": "true"}]},
+                    {**recipe(), "ingredients": [{**recipe()["ingredients"][0], "quantity": 2}]},
+                    {**recipe(), "extra": "field"}]
+        for invalid in invalids:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_result(invalid, cooking=True)
 
     def test_downloaded_video_has_kernel_size_limit_and_temporary_file_is_removed(self):
         paths = []

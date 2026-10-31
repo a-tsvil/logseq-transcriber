@@ -5,11 +5,17 @@ import secrets
 
 root = Path(__file__).resolve().parents[1]
 os.umask(0o077)
-for folder in (".secrets", "data/inbox", "data/n8n", "data/logseq", "data/caddy", "data/caddy-config"):
+for folder in (".secrets", ".secrets/telegram-index", "data/inbox", "data/n8n", "data/logseq", "data/caddy", "data/caddy-config"):
     (root / folder).mkdir(parents=True, exist_ok=True)
 (root / ".secrets/logseq-token").touch(exist_ok=True)
 (root / ".secrets/logseq-encryption.json").touch(exist_ok=True)
 (root / ".secrets/gemini-api-key").touch(exist_ok=True)
+graphs = root / ".secrets/logseq-graphs.json"
+if not graphs.exists():
+    graphs.write_text("[]\n")
+policy = root / ".secrets/sync-policy.env"
+if not policy.exists():
+    policy.write_text("TRAINING_OWNER_EMAIL=\nTRAINING_ALLOWLIST_TOKEN=" + secrets.token_hex(32) + "\n")
 env = root / ".env"
 if not env.exists():
     template = (root / ".env.example").read_text()

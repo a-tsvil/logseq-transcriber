@@ -1,0 +1,8 @@
+/* Append to the graph's custom.css in Settings > General > Edit custom.css.
+   Keep the checklist's parent bullet and clickable checkbox controls.
+   Only hide child block bullets under bot-generated "Checklist · HH:MM" headings.
+   Remove this rule to restore the child bullet/drag handles. */
+.ls-block[data-block-title^="Checklist · "] .ls-block
+  > .block-main-container > .block-control-wrap .bullet-link-wrap {
+  visibility: hidden;
+}

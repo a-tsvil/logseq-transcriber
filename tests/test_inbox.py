@@ -1,5 +1,7 @@
 import json
 import base64
+from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 import tempfile
 import subprocess
@@ -20,6 +22,9 @@ def update(identifier=1, sender=101, text="Squats: 3 sets. https://youtu.be/exam
 
 class InboxTests(unittest.TestCase):
     def setUp(self):
+        activity = patch("src.inbox.telegram_activity", side_effect=lambda *args, **kwargs: nullcontext())
+        activity.start()
+        self.addCleanup(activity.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.inbox = Inbox(self.temporary.name, "101,202")
         description_patch = patch("src.inbox.fetch_description", return_value={"status": "empty"})
@@ -43,6 +48,142 @@ class InboxTests(unittest.TestCase):
         self.inbox.allowed.clear()
         self.inbox.remember([update()])
         self.assertEqual(self.inbox.pending()["submissions"], [])
+
+    def test_cooking_links_and_video_captions_select_cooking_without_changing_workouts(self):
+        video = update(2, text="", attachment={"file_id": "video", "mime_type": "video/mp4"})
+        video["message"].pop("text")
+        video["message"]["caption"] = "/cook"
+        self.inbox.remember([update(1, text="/cook https://youtu.be/example"), video, update(3),
+                             update(4, sender=999, text="/cook https://youtu.be/example")])
+        for identifier in (1, 2):
+            self.assertEqual(self.record(identifier)["analysis"]["type"], "cooking")
+        self.assertEqual(self.record(1)["source_urls"], ["https://youtu.be/example"])
+        self.assertEqual(self.record(2)["attachment"]["file_id"], "video")
+        self.assertNotIn("type", self.record(3)["analysis"])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM submissions").fetchone()[0], 3)
+        self.assertIn("cook", [c["command"] for c in self.inbox.commands(202)])
+        self.assertIn("/cook https://", self.inbox.help_text(202))
+
+    def test_bare_cook_command_waits_for_next_video_link_without_saving_a_note(self):
+        self.inbox.bot_token = "test-only"
+        with patch.object(self.inbox, "telegram", return_value=True) as telegram:
+            self.inbox.remember([update(text="/cook")])
+        self.assertIn("/cancel", telegram.call_args.args[1]["text"])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM submissions").fetchone()[0], 0)
+        self.inbox.bot_token = ""
+        self.inbox.remember([update(2, text="https://youtu.be/BaW_jenozKc"), update(3)])
+        self.assertEqual(self.record(2)["analysis"]["type"], "cooking")
+        self.assertEqual(self.record(2)["original_text"], "https://youtu.be/BaW_jenozKc")
+        self.assertNotIn("type", self.record(3)["analysis"])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM cooking_requests").fetchone()[0], 0)
+
+    def test_cooking_wait_survives_restart_and_accepts_video_attachment(self):
+        self.inbox.remember([update(1, text="/cook")])
+        self.inbox.db.close()
+        self.inbox = Inbox(self.temporary.name, "101,202")
+        self.inbox.remember([update(2, text="", attachment={"file_id": "video", "mime_type": "video/mp4"})])
+        self.assertEqual(self.record(2)["analysis"]["type"], "cooking")
+        self.assertEqual(self.record(2)["attachment"]["file_id"], "video")
+
+    def test_cooking_wait_is_private_per_user_and_cancel_does_not_save_note(self):
+        self.inbox.remember([update(1, sender=999, text="/cook"), update(2, chat_type="group", text="/cook")])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM cooking_requests").fetchone()[0], 0)
+        self.inbox.remember([update(3, text="/cook"), update(4, sender=202),
+                             update(5, sender=999, text="/cancel"), update(6, chat_type="group", text="/cancel")])
+        self.assertNotIn("type", self.record(4)["analysis"])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM cooking_requests").fetchone()[0], 1)
+        self.inbox.remember([update(7, text="/cancel"), update(8)])
+        self.assertNotIn("type", self.record(8)["analysis"])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM cooking_requests").fetchone()[0], 0)
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM submissions").fetchone()[0], 2)
+
+    def test_cooking_wait_keeps_invalid_input_and_commands_from_becoming_notes(self):
+        self.inbox.remember([update(1, text="/cook"), update(2, text="not a video"),
+                             update(3, text="https://example.com/"), update(4, text="/help"),
+                             update(5, text="/unknown"), update(6, text="/checklist"),
+                             update(7, text="file", attachment={"file_id": "document", "mime_type": "application/pdf"})])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM submissions").fetchone()[0], 0)
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM checklist_drafts").fetchone()[0], 0)
+        self.inbox.remember([update(8, text="/cook https://youtu.be/BaW_jenozKc"), update(9, text="https://youtu.be/BaW_jenozKc")])
+        self.assertEqual(self.record(8)["analysis"]["type"], "cooking")
+        self.assertNotIn("type", self.record(9)["analysis"])
+        self.inbox.remember([update(1, text="/cook"), update(8, text="/cook https://youtu.be/BaW_jenozKc")])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM cooking_requests").fetchone()[0], 0)
+
+    def test_cooking_wait_is_retained_when_graph_access_is_unavailable(self):
+        self.inbox.remember([update(1, text="/cook")])
+        with patch.object(self.inbox, "registered_user", return_value=True), patch.object(self.inbox, "find_graph", return_value=None):
+            self.inbox.remember([update(2, text="https://youtu.be/BaW_jenozKc")])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM submissions").fetchone()[0], 0)
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM cooking_requests").fetchone()[0], 1)
+
+    def test_help_and_start_are_private_commands_and_never_exported(self):
+        self.inbox.admin_id = 101
+        self.inbox.bot_token = "test-only"
+        with patch.object(self.inbox, "telegram", return_value=True) as telegram:
+            self.inbox.remember([update(1, text="/help"), update(2, sender=202, text="/start"),
+                                 update(3, sender=999, text="/help"), update(4, chat_type="group", text="/help")])
+        self.assertEqual(telegram.call_count, 2)
+        self.assertIn("/sync allow", telegram.call_args_list[0].args[1]["text"])
+        self.assertNotIn("/sync", telegram.call_args_list[1].args[1]["text"])
+        self.assertIn('/checklist "Graph name"\n', telegram.call_args_list[1].args[1]["text"])
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM submissions").fetchone()[0], 0)
+        self.assertEqual(self.inbox.db.execute("SELECT offset FROM state").fetchone()[0], 5)
+
+    def test_command_menu_scopes_hide_owner_management_from_contributors(self):
+        self.inbox.admin_id = 101
+        self.inbox.bot_token = "test-only"
+        with patch.object(self.inbox, "telegram", return_value=True) as telegram:
+            self.assertEqual(self.inbox.configure_commands(), 2)
+        registrations = [call.args[1] for call in telegram.call_args_list if call.args[0] == "setMyCommands"]
+        self.assertEqual([row["commands"] for row in registrations[:2]], [[], []])
+        owner, contributor = registrations[2:]
+        self.assertEqual(owner["scope"], {"type": "chat", "chat_id": 101})
+        self.assertEqual(contributor["scope"], {"type": "chat", "chat_id": 202})
+        self.assertIn("sync", [c["command"] for c in owner["commands"]])
+        self.assertNotIn("sync", [c["command"] for c in contributor["commands"]])
+        for row in (owner, contributor):
+            for command in row["commands"]:
+                self.assertRegex(command["command"], r"^[a-z0-9_]{1,32}$")
+                self.assertTrue(1 <= len(command["description"]) <= 256)
+        self.assertEqual(sum(call.args[0] == "setChatMenuButton" for call in telegram.call_args_list), 2)
+        self.assertFalse(any(call.args[0] in ("sendMessage", "getUpdates") for call in telegram.call_args_list))
+
+    def test_command_registration_skips_an_unconfigured_bot(self):
+        with patch.object(self.inbox, "telegram") as telegram:
+            self.assertEqual(self.inbox.configure_commands(), 0)
+            self.inbox.bot_token = "test-only"
+            self.inbox.allowed.clear()
+            self.assertEqual(self.inbox.configure_commands(), 0)
+            telegram.assert_not_called()
+
+    def test_sync_commands_are_owner_only_and_not_exported(self):
+        self.inbox.admin_id = 101
+        self.inbox.allowlist_token = "policy-secret"
+        self.inbox.api_url = "http://logseq-sync:8787"
+        with patch("src.inbox.request_json", return_value={"ok": True}) as request:
+            self.inbox.remember([update(1, sender=202, text="/sync allow intruder@example.com"),
+                                 update(2, text="/sync allow Brother@Example.com"),
+                                 update(3, text="/sync allow invalid")])
+        request.assert_called_once_with("http://logseq-sync:8787/training/allowlist", {"email": "brother@example.com"},
+                                        {"Authorization": "Bearer policy-secret"}, method="PUT")
+        self.assertEqual(self.inbox.db.execute("SELECT count(*) FROM submissions").fetchone()[0], 0)
+        self.assertEqual(self.inbox.db.execute("SELECT offset FROM state").fetchone()[0], 4)
+
+    def test_sync_commands_list_remove_and_fail_without_leaking_secrets(self):
+        self.inbox.admin_id = 101
+        self.inbox.allowlist_token = "policy-secret"
+        self.inbox.api_url = "http://logseq-sync:8787"
+        with patch("src.inbox.request_json", return_value={"owner": "owner@example.com", "emails": ["brother@example.com"]}):
+            self.assertIn("owner@example.com (owner)", self.inbox.sync_accounts("/sync list", 101))
+        with patch("src.inbox.request_json", return_value={"ok": True}) as request:
+            self.assertIn("removed", self.inbox.sync_accounts("/sync remove brother@example.com", 101))
+            self.assertEqual(request.call_args.kwargs["method"], "DELETE")
+        with patch("src.inbox.request_json", side_effect=OSError("policy-secret")):
+            self.assertEqual(self.inbox.sync_accounts("/sync allow brother@example.com", 101), "Sync account update failed; retry later.")
+        with patch("src.inbox.request_json") as request:
+            self.assertIn("Only", self.inbox.sync_accounts("/sync list", 202))
+            request.assert_not_called()
 
     def test_duplicate_delivery_preserves_one_record(self):
         self.inbox.remember([update(), update()])
@@ -279,6 +420,81 @@ class InboxTests(unittest.TestCase):
         self.assertTrue(self.record()["analysis"]["published"])
         self.assertIn("AI processed", self.record()["page_title"])
         self.assertEqual(self.inbox.db.execute("SELECT done FROM submissions").fetchone()[0], 1)
+
+    def test_analyzed_video_links_to_current_journal_and_retries_without_duplicates_or_ai(self):
+        from tests.test_analysis import result
+        self.configure_logseq()
+        self.inbox.ai.enabled = True
+        self.inbox.ai.key_file = Path(self.temporary.name) / "gemini-key"
+        self.inbox.ai.key_file.write_text("FAKE_TEST_KEY")
+        self.inbox.bot_token = "fake-bot"
+        self.inbox.remember([update(text="https://youtu.be/BaW_jenozKc")])
+        captures, plaintext = [], []
+
+        def respond(url, payload, headers, method=None):
+            if url.endswith("/e2ee/encrypt"):
+                plaintext.extend(payload["texts"])
+                return self.encrypt_response(url, payload, headers)
+            if url.endswith("/pages"):
+                return {"uuid": "video-page"}
+            if url.endswith("/capture"):
+                captures.append(payload)
+                if len(captures) == 1:
+                    raise TimeoutError("Response lost after journal write")
+                return {"page-id": "journal-page"}
+            return {}
+
+        with patch.object(self.inbox, "telegram", return_value={}), patch("src.inbox.request_json", side_effect=respond), \
+                patch("src.analysis.generate", return_value=result()) as ai, patch("src.inbox.datetime") as clock:
+            clock.now.return_value = datetime.fromisoformat("2026-11-01T00:30:00+01:00")
+            self.inbox.capture(1)
+            self.assertFalse(captures)
+            self.inbox.capture(1)
+            self.assertEqual(self.inbox.db.execute("SELECT done FROM submissions").fetchone()[0], 0)
+            prepared = self.record()["journal_link"]
+            self.assertEqual(prepared["journal-day"], 20261101)
+            clock.now.assert_called_once_with(self.inbox.zone)
+            clock.now.return_value = datetime.fromisoformat("2026-11-02T00:30:00+01:00")
+            self.inbox.capture(1)
+            self.assertEqual(self.inbox.capture(1)["status"], "already_processed")
+            self.assertEqual(ai.call_count, 1)
+        self.assertEqual(captures[0], captures[1])
+        self.assertEqual(plaintext.count("[[video-page]]"), 1)
+        self.assertNotIn("video-page", json.dumps(captures))
+        self.assertTrue(self.record()["journal_link"]["published"])
+        self.assertEqual(self.record()["page_id"], "video-page")
+        self.assertEqual(self.record()["journal_link"]["page_id"], "journal-page")
+        self.assertEqual(self.inbox.db.execute("SELECT done FROM submissions").fetchone()[0], 1)
+
+    def test_journal_links_apply_to_cooking_and_workouts_but_not_unanalyzed_or_plain_notes(self):
+        item = {"analysis": {"status": "completed", "published": True}, "source_urls": ["https://youtu.be/BaW_jenozKc"]}
+        self.assertTrue(self.inbox.needs_journal_link(item))
+        item["analysis"]["type"] = "cooking"
+        self.assertTrue(self.inbox.needs_journal_link(item))
+        item["source_urls"] = []
+        self.assertFalse(self.inbox.needs_journal_link(item))
+        item["attachment"] = {"mime_type": "video/mp4"}
+        self.assertTrue(self.inbox.needs_journal_link(item))
+        for analysis in ({"status": "completed"}, {"status": "pending"}, {"status": "needs_review"}):
+            item["analysis"] = analysis
+            with patch("src.inbox.request_json") as request:
+                self.inbox.publish_journal_link(item)
+            request.assert_not_called()
+
+    def test_journal_link_refuses_prepared_content_from_another_graph(self):
+        self.configure_logseq()
+        item = {"id": 1, "graph_id": self.inbox.graph_id, "page_id": "video-page",
+                "analysis": {"status": "completed", "published": True},
+                "source_urls": ["https://youtu.be/BaW_jenozKc"],
+                "encrypted_payload": {"graph_id": "other-graph"}}
+        with patch("src.inbox.request_json") as request, self.assertRaises(ValueError):
+            self.inbox.publish_journal_link(item)
+        request.assert_not_called()
+        item["encrypted_payload"]["graph_id"] = self.inbox.graph_id
+        item["journal_link"] = {"graph_id": "other-graph"}
+        with patch("src.inbox.request_json") as request, self.assertRaises(ValueError):
+            self.inbox.publish_journal_link(item)
+        request.assert_not_called()
 
     def test_only_allowlisted_private_command_can_approve_existing_video(self):
         self.inbox.remember([update()])

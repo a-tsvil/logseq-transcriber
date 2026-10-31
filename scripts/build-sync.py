@@ -9,7 +9,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 wrapper_ref = "7708e3dc9412f0308379a51fe8c6be8c82bd95c2"
 logseq_ref = "69da7e2215b336cc5123dafb2a1686996e39596c"
-image = "training-hub-logseq-sync:69da7e-selfhost2"
+image = "training-hub-logseq-sync:69da7e-selfhost6"
 
 with tempfile.TemporaryDirectory(prefix="training-sync-build-") as temporary:
     context = Path(temporary)
@@ -18,14 +18,23 @@ with tempfile.TemporaryDirectory(prefix="training-sync-build-") as temporary:
     (context / "selfhost-tokens.patch").write_bytes((root / "deploy/logseq-selfhost-tokens.patch").read_bytes())
     (context / "proxy-origin.patch").write_bytes((root / "deploy/logseq-proxy-origin.patch").read_bytes())
     (context / "proxy_origin_test.cljs").write_bytes((root / "tests/upstream_proxy_origin_test.cljs").read_bytes())
+    for name, source_path in (("account-allowlist.patch", "deploy/logseq-account-allowlist.patch"),
+                              ("allowlist.cljs", "deploy/sync_allowlist.cljs"),
+                              ("allowlist_test.cljs", "tests/upstream_allowlist_test.cljs"),
+                              ("checklist_test.cljs", "tests/upstream_checklist_test.cljs"),
+                              ("journal-checklists.patch", "deploy/logseq-journal-checklists.patch"),
+                              ("boolean-checklists.patch", "deploy/logseq-boolean-checklists.patch"),
+                              ("0008_training_allowlist.sql", "deploy/0008_training_allowlist.sql")):
+        (context / name).write_bytes((root / source_path).read_bytes())
     dockerfile = context / "images/sync-worker/Dockerfile"
     source = dockerfile.read_text()
     # This workspace has Docker's classic builder; caches do not affect the image.
     source = re.sub(r"--mount=type=cache,target=\S+ ", "", source)
+    source = source.replace("WORKDIR /src/deps/db-sync", "ENV JAVA_TOOL_OPTIONS=\"-Xmx1024m -XX:ActiveProcessorCount=2\"\nWORKDIR /src/deps/db-sync")
     anchor = "COPY mise.toml /src/mise.toml"
     assert source.count(anchor) == 1
-    source = source.replace(anchor, "COPY selfhost-tokens.patch proxy-origin.patch /tmp/\nRUN git apply --check /tmp/selfhost-tokens.patch /tmp/proxy-origin.patch && git apply /tmp/selfhost-tokens.patch /tmp/proxy-origin.patch\n\n" + anchor)
-    test_target = ':db-sync-proxy-test {:target :node-script :main logseq.db-sync.proxy-origin-test/main :output-to "worker/dist/proxy-origin-test.js" :compiler-options {:elide-asserts false} :devtools {:enabled false}} '
+    source = source.replace(anchor, "COPY selfhost-tokens.patch proxy-origin.patch account-allowlist.patch journal-checklists.patch boolean-checklists.patch /tmp/\nRUN git apply --check /tmp/selfhost-tokens.patch /tmp/proxy-origin.patch /tmp/account-allowlist.patch /tmp/journal-checklists.patch && git apply /tmp/selfhost-tokens.patch /tmp/proxy-origin.patch /tmp/account-allowlist.patch /tmp/journal-checklists.patch && git apply --check /tmp/boolean-checklists.patch && git apply /tmp/boolean-checklists.patch\nCOPY allowlist.cljs /src/deps/db-sync/src/logseq/db_sync/worker/allowlist.cljs\nCOPY 0008_training_allowlist.sql /src/deps/db-sync/worker/migrations/0008_training_allowlist.sql\n\n" + anchor)
+    test_target = ':db-sync-policy-test {:target :node-script :main logseq.db-sync.allowlist-test/main :output-to "worker/dist/policy-test.js" :compiler-options {:elide-asserts false} :devtools {:enabled false}} '
     configure_test = ('const fs=require("node:fs"),p="shadow-cljs.edn",s=fs.readFileSync(p,"utf8"),a=":db-sync {:target :esm";'
                       'if(s.split(a).length!==2)throw Error("Unexpected upstream build config");'
                       'fs.writeFileSync(p,s.replace(a,' + json.dumps(test_target) + '+a));')
@@ -33,8 +42,10 @@ with tempfile.TemporaryDirectory(prefix="training-sync-build-") as temporary:
     assert source.count(release) == 1
     source = source.replace(release,
                             "COPY proxy_origin_test.cljs /src/deps/db-sync/test/logseq/db_sync/proxy_origin_test.cljs\n"
+                            "COPY allowlist_test.cljs /src/deps/db-sync/test/logseq/db_sync/allowlist_test.cljs\n"
+                            "COPY checklist_test.cljs /src/deps/db-sync/test/logseq/db_sync/checklist_test.cljs\n"
                             "RUN mise exec -- node -e " + shlex.quote(configure_test) + "\n"
-                            "RUN mise exec -- clojure -M:cljs compile db-sync-proxy-test && mise exec -- node worker/dist/proxy-origin-test.js\n"
+                            "RUN mise exec -- clojure -M:cljs compile db-sync-policy-test && mise exec -- node worker/dist/policy-test.js\n"
                             "RUN mise exec -- pnpm run release")
     source = source.replace("COPY --chmod=755 --chown=node:node", "COPY --chown=node:node")
     source = source.replace("USER node:node", "RUN chmod 755 /usr/local/bin/start-sync-worker.sh\n\nUSER node:node")

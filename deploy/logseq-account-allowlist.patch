@@ -1,0 +1,140 @@
+--- a/deps/db-sync/src/logseq/db_sync/worker/auth.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/auth.cljs
+@@ -3,6 +3,7 @@
+             [logseq.common.authorization :as authorization]
+             [logseq.db-sync.common :as common]
+             [logseq.db-sync.index :as index]
++            [logseq.db-sync.worker.allowlist :as allowlist]
+             [promesa.core :as p]))
+ 
+ (def personal-access-token-prefix "logseq_pat_")
+@@ -38,27 +39,11 @@
+ (def ^:private recoverable-auth-errors
+   #{"invalid" "iss not found" "aud not found" "exp" "kid"})
+ 
+-(def ^:private truthy-env-values
+-  #{"1" "true" "yes" "on"})
+-
+ (defn- recoverable-auth-error?
+   [error]
+   (when error
+     (let [message (or (ex-message error) (some-> error .-message))]
+       (contains? recoverable-auth-errors message))))
+-
+-(defn- env-flag-enabled?
+-  [env k]
+-  (let [v (some-> env (aget k))]
+-    (cond
+-      (true? v) true
+-      (false? v) false
+-      (string? v) (contains? truthy-env-values (string/lower-case v))
+-      :else false)))
+-
+-(defn- allow-unverified-jwt-claims?
+-  [env]
+-  (env-flag-enabled? env "DB_SYNC_ALLOW_UNVERIFIED_JWT_CLAIMS"))
+ 
+ (defn- expired-token?
+   [token]
+@@ -70,20 +55,13 @@
+ 
+ (defn auth-claims [request env]
+   (let [token (token-from-request request)]
+-    (if (string? token)
+-      (if (expired-token? token)
+-        (p/resolved nil)
+-        (-> (authorization/verify-jwt token env)
+-            (p/catch (fn [error]
+-                       (cond
+-                         (recoverable-auth-error? error)
+-                         nil
+-
+-                         (allow-unverified-jwt-claims? env)
+-                         (unsafe-jwt-claims token)
+-
+-                         :else
+-                         (p/rejected error))))))
++    (if (and (string? token) (not (expired-token? token)))
++      (-> (authorization/verify-jwt token env)
++          (p/catch (fn [error]
++                     (if (recoverable-auth-error? error)
++                       nil
++                       (p/rejected error))))
++          (p/then (fn [claims] (allowlist/<allowed-claims env claims))))
+       (p/resolved nil))))
+ 
+ (defn personal-access-token?
+@@ -115,13 +93,15 @@
+       (if-let [db (aget env "DB")]
+         (p/let [token-hash (<sha-256-hex token)
+                 pat (index/<personal-access-token-by-hash db token-hash)
+-                scope (some-> pat :permission permission->scope)]
++                scope (some-> pat :permission permission->scope)
++                claims
+           (when (and pat
+                      scope
+                      (> (:expires-at pat) (common/now-ms)))
+             #js {"sub" (:user-id pat)
+                  "scope" scope
+                  "pat_id" (:id pat)
+-                 "pat_graph_id" (:graph-id pat)}))
++                 "pat_graph_id" (:graph-id pat)})]
++          (allowlist/<allowed-claims env claims))
+         (p/resolved nil))
+       (auth-claims request env))))
+--- a/deps/db-sync/src/logseq/db_sync/worker/dispatch.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/dispatch.cljs
+@@ -5,6 +5,7 @@
+             [logseq.db-sync.index :as index]
+             [logseq.db-sync.platform.core :as platform]
+             [logseq.db-sync.worker.auth :as auth]
++            [logseq.db-sync.worker.allowlist :as allowlist]
+             [logseq.db-sync.worker.asset-link :as asset-link]
+             [logseq.db-sync.worker.handler.assets :as assets-handler]
+             [logseq.db-sync.worker.handler.e2ee :as e2ee-handler]
+@@ -198,8 +199,11 @@
+            path (.-pathname url)
+            method (.-method request)]
+        (cond
++         (contains? #{"/training/allowlist" "/training/graphs"} path)
++         (allowlist/handle request env)
++
+          (= path "/health")
+-         (http/json-response :worker/health {:ok true})
++         (http/json-response :worker/health {:ok true :account-allowlist true :journal-checklists true :shared-graphs true :boolean-checklists true})
+ 
+          (= path "/openapi.json")
+          (http/json-response nil (semantic-routes/openapi-document (or (aget env "COGNITO_ISSUER") "")))
+@@ -254,7 +258,9 @@
+              (not (seq graph-id))
+              (http/bad-request "missing graph id")
+ 
+-             (or (= tail "/semantic")
++             (or (= tail "/training")
++                 (string/starts-with? tail "/training/")
++                 (= tail "/semantic")
+                  (string/starts-with? tail "/semantic/"))
+              (http/not-found)
+ 
+--- a/deps/db-sync/src/logseq/db_sync/worker.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker.cljs
+@@ -50,9 +50,16 @@
+   (fetch [this request]
+          (->
+           (p/do
+-            (if (common/upgrade-request? request)
+-              (ws-handler/handle-ws this request)
+-              (sync-handler/handle-http this request)))
++            (if (= "/training/revoke" (.-pathname (js/URL. (.-url request))))
++              (let [user-id (.get (.-searchParams (js/URL. (.-url request))) "user-id")]
++                (doseq [socket (.getWebSockets (.-state this))]
++                  (when (= user-id (:user-id (presence/get-user this socket)))
++                    (presence/remove-presence! this socket)
++                    (.close socket 1008 "Account access revoked")))
++                (common/json-response {:ok true} 200))
++              (if (common/upgrade-request? request)
++                (ws-handler/handle-ws this request)
++                (sync-handler/handle-http this request))))
+           (p/catch (fn [error]
+                      (let [message (cond
+                                      (instance? ExceptionInfo error) (str (.-message error) " | " (pr-str (ex-data error)))

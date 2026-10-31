@@ -1,0 +1,90 @@
+--- a/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/handler/semantic.cljs
+@@ -347,6 +347,18 @@
+       {:block/title (db-content/title-ref->id-ref title refs :replace-tag? false)
+        :block/refs (mapv #(vector :block/uuid (:block/uuid %)) refs)})))
+ 
++(def checklist-property :user.property/training-hub-checked)
++
++(defn- ensure-checklist-property! [conn config e2ee?]
++  (let [existing (d/entity @conn checklist-property)]
++    (when (and existing (not= :checkbox (:logseq.property/type existing)))
++      (throw (js/Error. "Checklist property must have checkbox type")))
++    (or existing
++        (outliner-property/upsert-property! conn checklist-property
++          {:logseq.property/type :checkbox :db/cardinality :db.cardinality/one
++           :logseq.property/ui-position :block-left}
++          {:property-name (:title config) :e2ee? e2ee? :encrypted-name (:name config)}))))
++
+ (defn- valid-tree-identities? [db target nodes]
+   (let [seen (atom #{})
+         valid-id? (fn [id]
+@@ -358,6 +370,9 @@
+                     existing (when parsed (d/entity db [:block/uuid parsed]))]
+                 (and (non-blank-string? (:title node))
+                      (or (not (contains? node :task)) (boolean? (:task node)))
++                     (or (not (contains? node :checkbox)) (boolean? (:checkbox node)))
++                     (not (and (true? (:checkbox node)) (true? (:task node))))
++                     (or (not (true? (:checkbox node))) (d/entity db checklist-property))
+                      (or (not (contains? node :uuid))
+                          (and parsed (not (contains? @seen parsed))
+                               (do (swap! seen conj parsed) true)))
+@@ -393,6 +408,10 @@
+                                                        (:db/id (d/entity @conn :logseq.class/Task)))
+                 (outliner-property/set-block-property! conn (:db/id task) :logseq.property/status
+                                                        (:db/id (d/entity @conn :logseq.property/status.todo)))))
++            ;; Initialize fresh items only; retries must never uncheck existing items.
++            (when (and (true? (:checkbox node)) (contains? fresh-ids (:block/uuid block)))
++              (outliner-property/set-block-property! conn
++                (:db/id (d/entity @conn [:block/uuid (:block/uuid block)])) checklist-property false))
+             (let [existing (d/entity @conn [:block/uuid (:block/uuid block)])
+                   children (when (seq (:children node))
+                              (insert-tree! conn existing (:children node) "append" e2ee?))]
+@@ -822,9 +841,14 @@
+     :semantic/capture
+     (p/let [body (body-clj request)]
+       (if (or (not (sequential? (:blocks body))) (empty? (:blocks body))
+-              (and (contains? body :journal-day) (not (valid-journal-day? (:journal-day body)))))
++              (and (contains? body :journal-day) (not (valid-journal-day? (:journal-day body))))
++              (and (contains? body :checkbox-property)
++                   (not (and (non-blank-string? (get-in body [:checkbox-property :title]))
++                             (non-blank-string? (get-in body [:checkbox-property :name]))))))
+         (http/bad-request "invalid blocks or journal-day")
+-        (let [today (authored-write! conn creator ensure-journal-page! (:journal-day body))]
++        (let [_ (when-let [config (:checkbox-property body)]
++                  (authored-write! conn creator ensure-checklist-property! config e2ee?))
++              today (authored-write! conn creator ensure-journal-page! (:journal-day body))]
+           (if-not (valid-tree-identities? @conn today (:blocks body))
+             (http/bad-request "invalid capture block identities")
+             (let [inserted (authored-write! conn creator insert-tree! today (:blocks body) "append" e2ee?)]
+@@ -1143,6 +1167,8 @@
+                            (and (= handler :semantic/blocks-update)
+                                 (:block/name (find-entity db (:block-id path-params))))))
+               [(:name body)])
++            (when (and (= handler :semantic/capture) (:checkbox-property body))
++              [(get-in body [:checkbox-property :title]) (get-in body [:checkbox-property :name])])
+             (when (contains? e2ee-tree-handlers handler)
+               (block-trees-titles (:blocks body))))))))
+ 
+--- a/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
++++ b/deps/db-sync/src/logseq/db_sync/worker/routes/semantic.cljs
+@@ -224,7 +224,10 @@
+                                                                :properties {:block-id {:type "string"}
+                                                                             :property-id {:type "string"}}}}}}
+     "captureToToday" {:required ["blocks"]
+-                      :properties {:journal-day {:type "integer" :description "Optional valid calendar date as YYYYMMDD; preserves the intended date across retries."}
++                      :properties {:checkbox-property {:type "object" :required ["title" "name"]
++                                                        :description "Initialize the boolean checkbox property; labels must be encrypted on E2EE graphs."
++                                                        :properties {:title {:type "string"} :name {:type "string"}}}
++                                   :journal-day {:type "integer" :description "Optional valid calendar date as YYYYMMDD; preserves the intended date across retries."}
+                                    :blocks {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
+     "createTask" {:required ["title"]
+                   :properties {:title {:type "string"}
+@@ -350,6 +353,7 @@
+                           :properties {:uuid {:type "string" :format "uuid"
+                                               :description "Optional stable identity for retry-safe insertion. An existing block under the same parent is reused without changing its title or order; duplicate IDs and other-parent collisions are rejected."}
+                                        :title {:type "string"}
++                                       :checkbox {:type "boolean" :description "Initialize a fresh item as unchecked; existing state is preserved on retry. Requires checkbox-property on initial capture."}
+                                        :task {:type "boolean" :description "Initialize a new block as a native TODO Task. Existing blocks retain their current status on retries."}
+                                        :children {:type "array" :items {:$ref "#/components/schemas/BlockTree"}}}}
+               :BlockResponse {:type "object" :required ["uuid" "kind" "title"]

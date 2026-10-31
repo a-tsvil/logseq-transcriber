@@ -13,30 +13,45 @@ assert ip, "PUBLIC_IP is not configured"
 credential = base64.b64encode(("training:" + env["MEDIA_PASSWORD"]).encode()).decode()
 headers = {"Authorization": "Basic " + credential}
 
+for path in ("/", "/training-config.js", "/js/main.js"):
+    try:
+        with urlopen(f"https://{ip}" + path, timeout=15):
+            raise AssertionError("Removed web client is still served")
+    except HTTPError as error:
+        assert error.code == 404, error.code
+        error.close()
+print("PASS hosted web client is absent; trusted HTTPS remains available")
+
 try:
-    with urlopen("https://" + ip, timeout=15):
-        raise AssertionError("Browser accepted an unauthenticated visitor")
+    with urlopen(f"https://{ip}/media/0", timeout=15):
+        raise AssertionError("Attachment accepted an unauthenticated visitor")
 except HTTPError as error:
     assert error.code == 401
     assert error.headers.get("WWW-Authenticate", "").startswith("Basic")
     error.close()
-print("PASS browser requires basic authentication")
-
-with urlopen(Request("https://" + ip, headers=headers), timeout=15) as response:
-    assert response.status == 200
-    assert response.headers["Cross-Origin-Opener-Policy"] == "same-origin"
-    assert response.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
-    assert '<head><script src="/training-config.js"></script>' in response.read().decode()
-print("PASS browser HTTPS, trusted IP certificate, and isolation headers")
-
-with urlopen(Request(f"https://{ip}/training-config.js", headers=headers), timeout=15) as response:
-    assert "sync-server-url" in response.read().decode()
-    assert "no-cache" in response.headers.get("Cache-Control", "")
-print("PASS sync configuration loads before Logseq without a stale browser cache")
+print("PASS attachments require Basic authentication")
 
 with urlopen(f"https://{ip}:8443/health", timeout=15) as response:
     assert response.status == 200
+    if env.get("LOGSEQ_SYNC_IMAGE") in ("training-hub-logseq-sync:69da7e-selfhost3", "training-hub-logseq-sync:69da7e-selfhost4", "training-hub-logseq-sync:69da7e-selfhost5", "training-hub-logseq-sync:69da7e-selfhost6"):
+        health = json.load(response)
+        assert health.get("account-allowlist") is True
+        if env.get("LOGSEQ_SYNC_IMAGE") in ("training-hub-logseq-sync:69da7e-selfhost4", "training-hub-logseq-sync:69da7e-selfhost5", "training-hub-logseq-sync:69da7e-selfhost6"):
+            assert health.get("journal-checklists") is True
+            if env.get("LOGSEQ_SYNC_IMAGE") in ("training-hub-logseq-sync:69da7e-selfhost5", "training-hub-logseq-sync:69da7e-selfhost6"):
+                assert health.get("shared-graphs") is True
+                if env.get("LOGSEQ_SYNC_IMAGE") == "training-hub-logseq-sync:69da7e-selfhost6":
+                    assert health.get("boolean-checklists") is True
 print("PASS sync HTTPS")
+
+for path in ("/training/graphs", "/training/allowlist", "/admin/graphs/00000000-0000-4000-8000-000000000000"):
+    try:
+        with urlopen(f"https://{ip}:8443" + path, timeout=15):
+            raise AssertionError("Public management endpoint accepted a request")
+    except HTTPError as error:
+        assert error.code == 404, error.code
+        error.close()
+print("PASS sync management endpoints are private")
 
 for url in (f"https://{ip}:8443/api/v1/graphs", f"https://{ip}/media/0"):
     try:
@@ -50,6 +65,9 @@ print("PASS graph API and attachments still require authentication")
 fake_claims = {"sub": "00000000-0000-4000-8000-000000000000", "exp": int(time.time()) + 600,
                "iss": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_dtagLnju8",
                "aud": "69cs1lgme7p8kbgld8n5kseii6", "token_use": "id"}
+if env.get("LOGSEQ_SYNC_IMAGE") in ("training-hub-logseq-sync:69da7e-selfhost3", "training-hub-logseq-sync:69da7e-selfhost4", "training-hub-logseq-sync:69da7e-selfhost5", "training-hub-logseq-sync:69da7e-selfhost6"):
+    policy = dict(line.split("=", 1) for line in (root / ".secrets/sync-policy.env").read_text().splitlines() if "=" in line)
+    fake_claims.update(email=policy["TRAINING_OWNER_EMAIL"], email_verified=True)
 encoded = lambda value: base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
 unsigned_token = encoded({"alg": "none"}) + "." + encoded(fake_claims) + "."
 for authorization in (None, "Bearer " + unsigned_token):
@@ -64,6 +82,18 @@ for authorization in (None, "Bearer " + unsigned_token):
         assert error.code == 401, error.code
         error.close()
 print("PASS token creation rejects missing and unsigned login tokens")
+
+if env.get("LOGSEQ_SYNC_IMAGE") in ("training-hub-logseq-sync:69da7e-selfhost3", "training-hub-logseq-sync:69da7e-selfhost4", "training-hub-logseq-sync:69da7e-selfhost5", "training-hub-logseq-sync:69da7e-selfhost6"):
+    token = (root / ".secrets/logseq-token").read_text().strip()
+    key = json.loads((root / ".secrets/logseq-encryption.json").read_text())
+    assert token and key["graph_id"] == env["LOGSEQ_GRAPH_ID"]
+    request = Request(f"https://{ip}:8443/api/v1/graphs/{key['graph_id']}/e2ee/encrypt",
+                      data=json.dumps({"key": key["key"], "texts": ["sync access check"]}).encode(),
+                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    with urlopen(request, timeout=15) as response:
+        result = json.load(response)
+        assert len(result["texts"]) == 1 and isinstance(result["texts"][0], str)
+    print("PASS allowed account's existing PAT still authenticates without writing graph data")
 
 graph = env.get("LOGSEQ_GRAPH_ID") or "00000000-0000-4000-8000-000000000000"
 snapshot = f"https://{ip}:8443/sync/{graph}/snapshot/stream"
@@ -85,6 +115,6 @@ try:
     with urlopen(Request(f"https://{ip}/media/0", headers=headers), timeout=15):
         raise AssertionError("Missing attachment unexpectedly exists")
 except HTTPError as error:
-    assert error.code == 404, "Attachment authentication rejected the browser password"
+    assert error.code == 404, "Attachment authentication rejected MEDIA_PASSWORD"
     error.close()
-print("PASS browser password also authenticates attachment downloads")
+print("PASS attachment password still authenticates downloads")

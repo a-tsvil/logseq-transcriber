@@ -1,5 +1,6 @@
 """Unlock only the selected graph key locally; never save the account password/private key."""
 import getpass
+import argparse
 import json
 from pathlib import Path
 import subprocess
@@ -8,8 +9,12 @@ import warnings
 
 root = Path(__file__).resolve().parents[1]
 env = dict(line.split("=", 1) for line in (root / ".env").read_text().splitlines() if line and not line.startswith("#"))
-graph_id = str(uuid.UUID(env["LOGSEQ_GRAPH_ID"]))
-target = root / ".secrets/logseq-encryption.json"
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--graph-id", default=env["LOGSEQ_GRAPH_ID"], help="Graph UUID; defaults to LOGSEQ_GRAPH_ID")
+parser.add_argument("--output", type=Path, default=root / ".secrets/logseq-encryption.json", help="Private output file; existing keys are never overwritten")
+args = parser.parse_args()
+graph_id = str(uuid.UUID(args.graph_id))
+target = args.output if args.output.is_absolute() else root / args.output
 if target.exists() and target.stat().st_size:
     raise SystemExit("Graph key file already exists; refusing to overwrite it.")
 state = json.loads((root / ".secrets/lightsail.json").read_text())
@@ -42,4 +47,4 @@ assert key["graph_id"] == graph_id
 target.touch(mode=0o600, exist_ok=True)
 target.chmod(0o600)
 target.write_text(json.dumps(key) + "\n")
-print("Saved .secrets/logseq-encryption.json. Keep this file private.")
+print(f"Saved {target}. Keep this file private.")
